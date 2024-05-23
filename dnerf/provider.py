@@ -264,7 +264,7 @@ class NeRFDataset:
             self.error_map = None
 
         # [debug] uncomment to view all training poses.
-        # visualize_poses(self.poses.numpy())
+        visualize_poses(self.poses.numpy())
 
         # [debug] uncomment to view examples of randomly generated poses.
         # visualize_poses(rand_poses(100, self.device, radius=self.radius).cpu().numpy())

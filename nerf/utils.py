@@ -337,8 +337,9 @@ class Trainer(object):
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
+                 lambda_depth=None, # depth loss lambda, None = don't do depth supervision
                  ):
-        
+
         self.name = name
         self.opt = opt
         self.mute = mute
@@ -359,6 +360,8 @@ class Trainer(object):
         self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
+        self.depth_supervision = lambda_depth is not None
+        self.lambda_depth = lambda_depth
 
         model.to(self.device)
         if self.world_size > 1:
@@ -488,6 +491,9 @@ class Trainer(object):
             return pred_rgb, None, loss
 
         images = data['images'] # [B, N, 3/4]
+        
+        if self.depth_supervision:
+            gt_depth = data['depths'] 
 
         B, N, C = images.shape
 
@@ -506,11 +512,13 @@ class Trainer(object):
             gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
         else:
             gt_rgb = images
+            
 
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
         # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
     
         pred_rgb = outputs['image']
+        pred_depth = outputs['depth']
 
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
@@ -529,6 +537,12 @@ class Trainer(object):
         # special case for CCNeRF's rank-residual training
         if len(loss.shape) == 3: # [K, B, N]
             loss = loss.mean(0)
+
+        if self.depth_supervision:
+            depth_loss = F.l1_loss(pred_depth, gt_depth[...,0])
+            # print(pred_depth.mean(), gt_depth.mean())
+        else:
+            depth_loss = 0
 
         # update error_map
         if self.error_map is not None:
@@ -554,14 +568,14 @@ class Trainer(object):
             # put back
             self.error_map[index] = error_map
 
-        loss = loss.mean()
+        loss = loss.mean() + depth_loss
 
         # extra loss
         # pred_weights_sum = outputs['weights_sum'] + 1e-8
         # loss_ws = - 1e-1 * pred_weights_sum * torch.log(pred_weights_sum) # entropy to encourage weights_sum to be 0 or 1.
         # loss = loss + loss_ws.mean()
 
-        return pred_rgb, gt_rgb, loss
+        return pred_rgb, gt_rgb, loss, (depth_loss if self.depth_supervision else None)
 
     def eval_step(self, data):
 
@@ -746,7 +760,7 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                preds, truths, loss, depth_loss = self.train_step(data)
          
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -861,7 +875,7 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                preds, truths, loss, depth_loss = self.train_step(data)
          
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -883,9 +897,15 @@ class Trainer(object):
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
 
                 if self.scheduler_update_every_step:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    if self.depth_supervision:
+                        pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), depth loss={depth_loss:.4f}, lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    else:
+                        pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 else:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
+                    if self.depth_supervision:
+                        pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), depth loss={depth_loss:.4f}")
+                    else:
+                        pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
                 pbar.update(loader.batch_size)
 
         if self.ema is not None:
@@ -981,7 +1001,7 @@ class Trainer(object):
                     pred = (pred * 255).astype(np.uint8)
 
                     pred_depth = preds_depth[0].detach().cpu().numpy()
-                    pred_depth = (pred_depth * 255).astype(np.uint8)
+                    pred_depth = ((pred_depth/pred_depth.max()) * 255).astype(np.uint8)
                     
                     cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(save_path_depth, pred_depth)

@@ -223,7 +223,7 @@ class NeRFRenderer(nn.Module):
         
         # calculate depth 
         ori_z_vals = ((z_vals - nears) / (fars - nears)).clamp(0, 1)
-        depth = torch.sum(weights * ori_z_vals, dim=-1)
+        depth = torch.sum(weights * z_vals, dim=-1)
 
         # calculate color
         image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 3], in [0, 1]

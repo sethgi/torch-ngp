@@ -6,6 +6,7 @@ from cv2 import transform
 import tqdm
 import numpy as np
 from scipy.spatial.transform import Slerp, Rotation
+from PIL import Image
 
 import trimesh
 
@@ -27,11 +28,11 @@ def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
     return new_pose
 
 
-def visualize_poses(poses, size=0.1):
+def visualize_poses(poses, size=0.1, bound=2):
     # poses: [B, 4, 4]
 
     axes = trimesh.creation.axis(axis_length=4)
-    box = trimesh.primitives.Box(extents=(2, 2, 2)).as_outline()
+    box = trimesh.primitives.Box(extents=(bound, bound, bound)).as_outline()
     box.colors = np.array([[128, 128, 128]] * len(box.entities))
     objects = [axes, box]
 
@@ -105,6 +106,7 @@ class NeRFDataset:
         self.offset = opt.offset # camera offset
         self.bound = opt.bound # bounding box half length, also used as the radius to random sample poses.
         self.fp16 = opt.fp16 # if preload, load into fp16.
+        self.depth_supervision = opt.lambda_depth is not None
 
         self.training = self.type in ['train', 'all', 'trainval']
         self.num_rays = self.opt.num_rays if self.training else -1
@@ -192,10 +194,17 @@ class NeRFDataset:
             
             self.poses = []
             self.images = []
+            self.depths = [] if self.depth_supervision else None
             for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
                 f_path = os.path.join(self.root_path, f['file_path'])
                 if self.mode == 'blender' and '.' not in os.path.basename(f_path):
                     f_path += '.png' # so silly...
+                
+                if self.depth_supervision:
+                    depth_path = os.path.join(self.root_path, f['depth_file_path'])
+                    if self.mode == 'blender' and '.' not in os.path.basename(depth_path):
+                        depth_path += ".npy"
+
 
                 # there are non-exist paths in fox...
                 if not os.path.exists(f_path):
@@ -208,6 +217,12 @@ class NeRFDataset:
                 if self.H is None or self.W is None:
                     self.H = image.shape[0] // downscale
                     self.W = image.shape[1] // downscale
+
+                if self.depth_supervision:
+                    depth_image = np.load(depth_path)
+                    if depth_image.shape[0] != self.H or depth_image.shape[1] != self.W:
+                        depth_image = cv2.resize(depth_image, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
+                    depth_image = depth_image * self.scale
 
                 # add support for the alpha channel as a mask.
                 if image.shape[-1] == 3: 
@@ -222,10 +237,16 @@ class NeRFDataset:
 
                 self.poses.append(pose)
                 self.images.append(image)
+                
+                if self.depth_supervision:
+                    self.depths.append(depth_image)
             
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
         if self.images is not None:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
+        if self.depths is not None:
+            self.depths = torch.from_numpy(np.stack(self.depths, axis=0))[..., None]
+
         
         # calculate mean radius of all camera poses
         self.radius = self.poses[:, :3, 3].norm(dim=-1).mean(0).item()
@@ -238,7 +259,7 @@ class NeRFDataset:
             self.error_map = None
 
         # [debug] uncomment to view all training poses.
-        # visualize_poses(self.poses.numpy())
+        # visualize_poses(self.poses.numpy(), bound=self.bound)
 
         # [debug] uncomment to view examples of randomly generated poses.
         # visualize_poses(rand_poses(100, self.device, radius=self.radius).cpu().numpy())
@@ -314,6 +335,13 @@ class NeRFDataset:
                 C = images.shape[-1]
                 images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
             results['images'] = images
+        
+        if self.depth_supervision and self.depths is not None:
+            depths = self.depths[index].to(self.device) # [B, H, W, 3/4]
+            if self.training:
+                C = depths.shape[-1]
+                depths = torch.gather(depths.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
+            results['depths'] = depths
         
         # need inds to update error_map
         if error_map is not None:
