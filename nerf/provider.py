@@ -176,6 +176,7 @@ class NeRFDataset:
 
             self.poses = []
             self.images = None
+            self.depths = None
             for i in range(n_test + 1):
                 ratio = np.sin(((i / n_test) - 0.5) * np.pi) * 0.5 + 0.5
                 pose = np.eye(4, dtype=np.float32)
